@@ -1,4 +1,4 @@
-## README.md
+# Hyena Hierarchy
 
 This code trains a character-level language model using a variant of a convolutional neural network architecture called Hyena. The trained model can be used to generate random text given a seed string.
 
@@ -37,6 +37,60 @@ To generate random text using the trained model, run `generate_text()` with the 
 ### Example
 
 You can run the example code in `main()` to train the model on a randomly generated text and generate random text given a seed string. Note: The training code works, however the inference code needs work. Help would be appreciated.
+
+
+## Hyena Model code overview
+
+### Text Dataset
+
+- $\text{TextDataset}(text, seq\_len)$: Initializes the text dataset with the given `text` and `seq_len`.
+    - `text` (string): input text.
+    - `seq_len` (int): sequence length.
+
+- `__len__()`: Returns the length of the dataset.
+
+- `__getitem__(index)`: Returns the tensor of the sequence and target at the given `index`.
+    - `index` (int): index of the sequence.
+
+### Hyena Model
+
+- $\text{Hyena}(input\_dim, output\_dim, filter\_size, depth, positional\_dim)$: Initializes the Hyena model with the given parameters.
+    - `input_dim` (int): input dimension.
+    - `output_dim` (int): output dimension.
+    - `filter_size` (int): filter size for convolution.
+    - `depth` (int): depth of the model.
+    - `positional_dim` (int): positional dimension of the model.
+
+- `forward(x)`: Computes the forward pass of the Hyena model with the given input tensor `x`.
+    - `x` (tensor): input tensor.
+
+### Training Hyena Model
+
+- `train_hyena_model(text_file, input_dim, output_dim, filter_size, depth, positional_dim, lr, num_epochs)`: Trains the Hyena model with the given parameters and returns the trained model, character list, and character-to-index dictionary.
+    - `text_file` (string): input text file path.
+    - `input_dim` (int): input dimension.
+    - `output_dim` (int): output dimension.
+    - `filter_size` (int): filter size for convolution.
+    - `depth` (int): depth of the model.
+    - `positional_dim` (int): positional dimension of the model.
+    - `lr` (float): learning rate.
+    - `num_epochs` (int): number of epochs.
+
+### Text Generation
+
+- `generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab)`: Generates text using the trained Hyena model with the given parameters.
+    - `model` (Hyena): trained Hyena model.
+    - `seed_text` (string): seed text.
+    - `length` (int): length of generated text.
+    - `char_to_idx` (dict): character-to-index dictionary.
+    - `idx_to_char` (dict): index-to-character dictionary.
+    - `vocab` (int): vocabulary size.
+    - `input_dim` (int): input dimension
+
+### Main Function
+
+- `main()`: Runs the main function which generates random text, trains the Hyena model, and generates text using the trained model.
+
 
 # Credits
 
