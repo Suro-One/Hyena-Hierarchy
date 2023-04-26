@@ -36,7 +36,7 @@ To generate random text using the trained model, run `generate_text()` with the 
 
 ### Example
 
-You can run the example code in `main()` to train the model on a randomly generated text and generate random text given a seed string. Note: The training code works, however the inference code needs work. Help would be appreciated.
+You can run the example code in `main()` to train the model on a randomly generated text and generate random text given a seed string.
 
 
 ## Hyena Model code overview

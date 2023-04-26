@@ -70,18 +70,23 @@ def train_hyena_model(text_file, input_dim, output_dim, filter_size, depth, posi
     return model, chars, char_to_idx
 
 
-def generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab):
+def generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab, input_dim):
     model.eval()
     with torch.no_grad():
         seed_indices = torch.LongTensor([
             char_to_idx.get(c, random.randint(0, vocab - 1)) for c in seed_text.lower()
         ])
+        if len(seed_indices) < input_dim:
+            seed_indices = torch.cat((seed_indices, torch.zeros(input_dim - len(seed_indices), dtype=torch.long)))
         out = []
         for i in range(length):
-            outputs = model(seed_indices.float())
+            seed_input = seed_indices.float().unsqueeze(0)
+            outputs = model(seed_input)
             probs = nn.functional.softmax(outputs[-1], dim=0).cpu().numpy()
             next_idx = np.random.choice(len(probs), p=probs)
             out.append(idx_to_char[next_idx])
+            seed_indices[:-1] = seed_indices[1:].clone()
+            seed_indices[-1] = next_idx
 
     return out
 
@@ -108,7 +113,7 @@ def main():
     idx_to_char = {idx: char for char, idx in char_to_idx.items()}
     seed_text = 'The quick brown fox'
     num_chars = 70
-    generated_text = generate_text(model, seed_text, num_chars, char_to_idx, idx_to_char, len(vocab))
+    generated_text = generate_text(model, seed_text, num_chars, char_to_idx, idx_to_char, len(vocab), input_dim)
     
     print('Generated text: ' + ''.join(generated_text))
 
