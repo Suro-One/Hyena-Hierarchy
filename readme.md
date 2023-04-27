@@ -66,15 +66,15 @@ You can run the example code in `main()` to train the model on a randomly genera
 
 ### Training Hyena Model
 
-- `train_hyena_model(text_file, input_dim, output_dim, filter_size, depth, positional_dim, lr, num_epochs)`: Trains the Hyena model with the given parameters and returns the trained model, character list, and character-to-index dictionary.
+- `train_hyena_model(text_file, input_dim, filter_size, depth, positional_dim, lr, num_epochs, batch_size=128)`: Trains the Hyena model with the given parameters and returns the trained model, character list, and character-to-index dictionary.
     - `text_file` (string): input text file path.
     - `input_dim` (int): input dimension.
-    - `output_dim` (int): output dimension.
     - `filter_size` (int): filter size for convolution.
     - `depth` (int): depth of the model.
     - `positional_dim` (int): positional dimension of the model.
     - `lr` (float): learning rate.
     - `num_epochs` (int): number of epochs.
+    - `batch_size` (int): batch size
 
 ### Text Generation
 

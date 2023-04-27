@@ -42,16 +42,14 @@ class Hyena(nn.Module):
         x = self.linear2(x)
         return x
 
-def train_hyena_model(text_file, input_dim, output_dim, filter_size, depth, positional_dim, lr, num_epochs):
+def train_hyena_model(text_file, input_dim, filter_size, depth, positional_dim, lr, num_epochs, batch_size=128):
     text = open(text_file, 'r').read()
     text = text.lower()
     chars = list(set(text))
-    vocab = len(chars)
     char_to_idx = {ch: i for i, ch in enumerate(chars)}
 
     dataset = TextDataset([char_to_idx[ch] for ch in text], input_dim)
-    dataloader = DataLoader(dataset, batch_size=input_dim)
-
+    dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=True)
    # Move model to GPU if available
     model = Hyena(input_dim, len(chars), filter_size, depth, positional_dim).to(device)
     criterion = nn.CrossEntropyLoss()
@@ -87,7 +85,8 @@ def generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab, inp
         for i in range(length):
             seed_input = seed_indices.float().unsqueeze(0).to(device)
             outputs = model(seed_input)
-            probs = nn.functional.softmax(outputs[-1], dim=0).cpu().numpy()
+            probs = nn.functional.softmax(outputs[-1], dim=0)
+            probs = probs.cpu().numpy()
             next_idx = np.random.choice(len(probs), p=probs)
             out.append(idx_to_char[next_idx])
             seed_indices[:-1] = seed_indices[1:].clone()
