@@ -6,6 +6,9 @@ import numpy as np
 import random
 import string
 
+# Check for GPU availability
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print('Using device:', device)
 class TextDataset(Dataset):
     def __init__(self, text, seq_len):
         self.text = text
@@ -49,13 +52,15 @@ def train_hyena_model(text_file, input_dim, output_dim, filter_size, depth, posi
     dataset = TextDataset([char_to_idx[ch] for ch in text], input_dim)
     dataloader = DataLoader(dataset, batch_size=input_dim)
 
-    model = Hyena(input_dim, len(chars), filter_size, depth, positional_dim)
-
+   # Move model to GPU if available
+    model = Hyena(input_dim, len(chars), filter_size, depth, positional_dim).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=lr)
 
     for epoch in range(1, num_epochs + 1):
         for seqs, targets in dataloader:
+            # Move tensors to GPU if available
+            seqs, targets = seqs.to(device), targets.to(device)
             model.zero_grad()
             outputs = model(seqs)
             loss = criterion(outputs, targets)
@@ -77,10 +82,10 @@ def generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab, inp
             char_to_idx.get(c, random.randint(0, vocab - 1)) for c in seed_text.lower()
         ])
         if len(seed_indices) < input_dim:
-            seed_indices = torch.cat((seed_indices, torch.zeros(input_dim - len(seed_indices), dtype=torch.long)))
+            seed_indices = torch.cat((seed_indices, torch.zeros(input_dim - len(seed_indices), dtype=torch.long))).to(device)
         out = []
         for i in range(length):
-            seed_input = seed_indices.float().unsqueeze(0)
+            seed_input = seed_indices.float().unsqueeze(0).to(device)
             outputs = model(seed_input)
             probs = nn.functional.softmax(outputs[-1], dim=0).cpu().numpy()
             next_idx = np.random.choice(len(probs), p=probs)
@@ -93,7 +98,7 @@ def generate_text(model, seed_text, length, char_to_idx, idx_to_char, vocab, inp
 def main():
     random_text = ''.join(
         random.choice(string.ascii_lowercase + string.digits + string.punctuation + ' ')
-        for _ in range(1000)
+        for _ in range(1337)
     )
     with open('random_text.txt', 'w') as f:
         f.write(random_text)
@@ -104,7 +109,7 @@ def main():
     depth = 3
     positional_dim = (input_dim - filter_size + 2 * (filter_size // 2)) // 1 + 1
     lr = 0.001
-    num_epochs = 100
+    num_epochs = 1000
 
     model, vocab, char_to_idx = train_hyena_model(
         'random_text.txt', input_dim, output_dim, filter_size, depth, positional_dim, lr, num_epochs
