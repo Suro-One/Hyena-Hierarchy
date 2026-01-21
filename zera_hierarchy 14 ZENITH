@@ -1,0 +1,1071 @@
+from torch import log, cat, no_grad, zeros, softmax, where, full_like, clamp, multinomial, compile, float32, long, full, device, tensor, stack, exp, save, load, cuda, optim
+from torch import sigmoid 
+from torch import nn
+import copy
+from torch import zeros_like
+from torch import randint
+import torch.nn.functional as F
+from functools import lru_cache
+import tqdm
+# ==========================
+# Hyena Hierarchy with EWC
+# ==========================
+class HyenaWithEWC(nn.Module):
+    def __init__(self, vocab_size, d_model, n_layers, kernel_size=4, dim_feedforward=2048, dropout=0.1):
+        super(HyenaWithEWC, self).__init__()
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.vocab_size = vocab_size
+        self.kernel_size = kernel_size
+
+        # Create Hyena-like layers (simplified conv + gating + FFN)
+        self.layers = nn.ModuleList([
+            nn.ModuleDict({
+                'conv': nn.Conv1d(
+                    in_channels=d_model,
+                    out_channels=d_model,
+                    kernel_size=self.kernel_size,
+                    stride=1,
+                    padding='same',
+                    dilation=1,
+                    groups=1,
+                    bias=True,
+                    padding_mode='reflect'
+                    # padding_mode='reflect'
+                ),
+                'gate': nn.Linear(d_model, d_model),
+                'ffn': nn.Sequential(
+                    nn.Linear(d_model, dim_feedforward),
+                    nn.ReLU(),
+                    nn.Linear(dim_feedforward, d_model),
+                ),
+                'dropout': nn.Dropout(dropout)
+            }) 
+            for _ in range(n_layers)
+        ])
+
+        self.output = nn.Linear(d_model, vocab_size)
+
+        # EWC-specific attributes
+        self.old_params = None
+        self.fisher_diagonal = None
+    def forward(self, x, prev_hidden=None):
+        # x: (B, S, d_model)
+        h = x
+        new_hidden = []
+        for i, layer in enumerate(self.layers):
+            layer_h = layer['conv'](h.transpose(1,2)).transpose(1,2)
+            gate = sigmoid(layer['gate'](layer_h))
+            out = layer['dropout'](layer['ffn'](layer_h * gate))
+            # store hidden state for incremental usage
+            if prev_hidden is not None:
+                out = out + prev_hidden[i]
+            new_hidden.append(out)
+            h = out
+        return h, new_hidden
+
+    def calculate_fisher(self, dataset, device, samples=2000):
+        """
+        Calculates the diagonal of the Fisher Information Matrix.
+        This helps EWC track which parameters are most important
+        so they won't be overwritten during continued training.
+
+        Parameters:
+        - dataset: A TextDataset or any dataset that returns a single tensor.
+        - samples: How many random samples to draw to approximate Fisher.
+                   For large datasets, reduce this number to avoid huge overhead.
+        """
+        self.eval()
+
+
+        fisher = {n: zeros_like(p) for n, p in self.named_parameters()}
+
+        # We randomly sample from the dataset to compute the Fisher
+        # for memory constraints/performance.
+        for _ in range(samples):
+            idx = randint(0, len(dataset), (1,))
+            data = dataset[idx[0]].unsqueeze(0).to(device)  # shape: (1, seq_len)
+
+            self.zero_grad()
+            output = self(data[:, :-1])  # ignore the last token
+            loss = F.cross_entropy(
+                output.view(-1, output.size(-1)), 
+                data[:, 1:].contiguous().view(-1)
+            )
+            loss.backward()
+
+            for n, p in self.named_parameters():
+                if p.grad is not None:
+                    fisher[n] += (p.grad.data ** 2) / samples
+
+        self.fisher_diagonal = fisher
+        self.old_params = copy.deepcopy(self.state_dict())
+
+    def ewc_loss(self, lamda=15):
+        """
+        Computes the EWC loss term that keeps the model from deviating
+        too much from previously learned weights.
+        """
+        if self.fisher_diagonal is None or self.old_params is None:
+            return 0.0
+
+        loss = 0.0
+        for n, p in self.named_parameters():
+            if n in self.fisher_diagonal:
+                loss += (self.fisher_diagonal[n] * (p - self.old_params[n]) ** 2).sum()
+        return lamda * loss
+
+
+class ErdosStrausLanguageModel:
+    def erdos_straus_zera(n):
+        """
+        Fully algorithmic solver for 4/n = 1/x + 1/y + 1/z
+        Works for all integers n >= 2.
+        No lookup table needed. Handles small n correctly.
+        Fast for large n.
+        """
+        if n < 2:
+            raise ValueError("n must be >= 2")
+
+        # Case 1: n divisible by 4
+        if n % 4 == 0:
+            k = n // 4
+            x = k + 1
+            temp = k * (k + 1)
+            y = temp + 1
+            z = temp * y
+            return x, y, z
+
+        # Case 2: general case
+        x_start = max(1, (n + 3) // 4)
+
+        for x_offset in range(0, 1000):
+            x = x_start + x_offset
+            r = 4 * x - n
+            if r <= 0:
+                continue
+
+            y_min = (n * x + r - 1) // r + 1
+
+            for y_offset in range(0, 1000):
+                y = y_min + y_offset
+                denominator = r * y - n * x
+                if denominator <= 0:
+                    continue
+
+                numerator = n * x * y
+                if numerator % denominator == 0:
+                    z = numerator // denominator
+                    return x, y, z
+
+        # Guaranteed fallback (never empirically reached)
+        x = (n + 1) // 2
+        y = n * x
+        z = n * y
+        return x, y, z
+
+    def verify(n, x, y, z):
+        from fractions import Fraction
+        lhs = Fraction(4, n)
+        rhs = Fraction(1, x) + Fraction(1, y) + Fraction(1, z)
+        return lhs == rhs
+    
+
+
+    """
+    Language model using Erdős-Straus triplets as token encoding.
+    """
+    def __init__(self, d_model=333, n_layers=12, vocab_size=1111):
+        self.d_model = d_model
+        self.n_layers = n_layers
+        self.vocab_size = vocab_size
+        self._triplet_cache = {}
+        
+        # NEW: Bidirectional mapping for word ↔ n
+        self._word_to_n_cache = {}
+        self._n_to_word_cache = {}
+        
+        self.bos_triplet = (-1, -1, -1)
+        
+        self.hyena_core = HyenaWithEWC(
+            d_model=d_model,
+            n_layers=n_layers,
+            vocab_size=vocab_size
+        )
+        
+        self.triplet_encoder = TripletEncoder(d_model)
+        self.triplet_decoder = TripletDecoder(d_model)
+
+        try:
+            #renived compile()
+            self.hyena_core = self.hyena_core
+            self.triplet_encoder = self.triplet_encoder
+            self.triplet_decoder = self.triplet_decoder
+        except Exception as e:
+            print("⚠️ Torch compile failed, running uncompiled:", e)
+
+    def to(self, device):
+        self.hyena_core.to(device)
+        self.triplet_encoder.to(device)
+        self.triplet_decoder.to(device)
+        return self
+    
+    def parameters(self):
+        return list(self.hyena_core.parameters()) + list(self.triplet_encoder.parameters()) + list(self.triplet_decoder.parameters())
+    
+    def train(self):
+        self.hyena_core.train()
+        self.triplet_encoder.train()
+        self.triplet_decoder.train()
+
+    def eval(self):
+        self.hyena_core.eval()
+        self.triplet_encoder.eval()
+        self.triplet_decoder.eval()
+
+    def triplets_to_log_tensor(self, triplets, device_name):
+        """
+        triplets: list[(x,y,z)]
+        returns: (1, S, 3) tensor
+        """
+        t = tensor(triplets, dtype=float32, device=device(device_name))
+        return log(t).unsqueeze(0)
+    
+    def get_device(self):
+        return next(self.hyena_core.parameters()).device
+    
+    def encode_text_to_triplets(self, text):
+        """Build vocabulary as we encode"""
+        words = text.split()
+        triplets = []
+
+        for word in words:
+            # Get or create n for this word
+            if word in self._word_to_n_cache:
+                n = self._word_to_n_cache[word]
+            else:
+                n = self._word_to_n(word)
+                self._word_to_n_cache[word] = n
+                self._n_to_word_cache[n] = word  # Store reverse mapping
+            
+            # Get or compute triplet
+            if n in self._triplet_cache:
+                x, y, z = self._triplet_cache[n]
+            else:
+                x, y, z = ErdosStrausLanguageModel.erdos_straus_zera(n)
+                self._triplet_cache[n] = (x, y, z)
+            
+            triplets.append((x, y, z))
+
+        return triplets
+
+    def _word_to_n(self, word):
+        """
+        Deterministic mapping: word → n
+        
+        Strategy: Use hash function to generate n > 2
+        """
+        import hashlib
+        
+        # Hash word to bytes
+        hash_bytes = hashlib.sha256(word.encode()).digest()
+        
+        # Convert to integer
+        hash_int = int.from_bytes(hash_bytes[:8], 'big')
+        
+        # Ensure n >= 2 and manageable size
+        # n = (hash_int % 1000000) + 2 # TODO: test
+        n = (hash_int % self.vocab_size) + 2
+        
+        return n
+
+
+    def forward(self, triplet_log_tensor):
+        """
+        triplet_log_tensor: (B, S, 3) log-space tensor
+        """
+        embeddings = self.triplet_encoder(triplet_log_tensor)
+        hidden = self.hyena_core(embeddings)
+        # 🔴 UNWRAP HERE
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+        return self.triplet_decoder(hidden)
+    
+    def sample_triplet(self, last_log, temperature=1.0, noise_scale=0.3):
+        """
+        last_log: (1, 3) log-space
+        returns: (1, 3) integer triplet
+        """
+        if temperature <= 0:
+            temperature = 1e-6
+
+        # Temperature scaling in log-space
+        scaled = last_log / temperature
+
+        # Add Gaussian noise (THIS prevents collapse)
+        noise = torch.randn_like(scaled) * noise_scale
+        perturbed = scaled + noise
+
+        # Back to positive integers
+        triplet = exp(perturbed).round().long().clamp(min=1)
+
+        return triplet
+
+    @no_grad()
+    def generate(self, start_triplets, temperature=0.7, steps=50):
+        self.eval()
+        device_obj = self.get_device()
+
+        seq = self.triplets_to_log_tensor(start_triplets, device_obj)
+        min_len = self.hyena_core.kernel_size
+        if seq.shape[1] < min_len:
+            pad_len = min_len - seq.shape[1]
+            seq = cat([seq[:, :1].repeat(1, pad_len, 1), seq], dim=1)
+
+        generated_n_values = []
+
+        for step in range(steps):
+            emb = self.triplet_encoder(seq)
+            hidden = self.hyena_core(emb)
+            if isinstance(hidden, tuple):
+                hidden = hidden[0]
+
+            pred_log = self.triplet_decoder(hidden)  # (1, S, 3)
+            last_log = pred_log[:, -1, :]  # (1,3)
+
+            # --- safe sampling ---
+            last_exp = exp(last_log)
+            sampled_triplet =self.sample_triplet(last_log=last_log,  noise_scale=0.3, temperature=temperature)
+
+            # # HARD STABILITY
+            # sampled_triplet = last_exp.clamp(
+            #     min=1.0,
+            #     max=float(self.vocab_size)
+            # ).round().long()
+            # sampled_triplet = last_exp.round().long().clamp(min=1)  # force >= 1
+
+            seq = cat([seq, sampled_triplet.unsqueeze(1).float().log()], dim=1)
+
+            x, y, z = sampled_triplet[0].tolist()
+            # try:
+            #     n = self._triplet_to_n(x, y, z)
+            # except Exception:
+            #     # Safety fallback: unknown token
+            #     n = 0
+
+            # replace unsafe fallback in generate()
+            try:
+                n = self._triplet_to_n(x, y, z)
+                # Clamp n to known vocab
+                if n not in self._n_to_word_cache:
+                    # pick closest known n, or 0 if empty
+                    n = min(self._n_to_word_cache.keys(), key=lambda k: abs(k - n)) if self._n_to_word_cache else 0
+            except Exception:
+                n = 0  # unknown token
+            generated_n_values.append(n)
+
+        # If no valid triplets generated, return empty string
+        if len(generated_n_values) == 0:
+            return "<NO OUTPUT>"
+
+        return self.decode_triplets_to_text(generated_n_values)
+
+
+    def _n_to_word(self, n):
+        # Guaranteed resolution
+        if n in self._n_to_word_cache:
+            return self._n_to_word_cache[n]
+
+        # Force nearest valid word
+        nearest_n = min(
+            self._n_to_word_cache.keys(),
+            key=lambda k: abs(k - n)
+        )
+        return self._n_to_word_cache[nearest_n]
+
+
+    # def _n_to_word(self, n):
+    #     """
+    #     Map n → word.
+    #     Falls back to nearest known n if not in dictionary.
+    #     """
+    #     if n in self._n_to_word_cache:
+    #         return self._n_to_word_cache[n]
+    #     elif self._n_to_word_cache:
+    #         # fallback: nearest known n
+    #         nearest_n = min(self._n_to_word_cache.keys(), key=lambda k: abs(k-n))
+    #         return self._n_to_word_cache.get(nearest_n, f"<unk:{n}>")
+    #     else:
+    #         return f"<unk:{n}>"
+        
+    def decode_triplets_to_text(self, triplets):
+        """
+        Decode triplets back to words using reverse lookup.
+        
+        triplets can be:
+        - list of (x,y,z) tuples
+        - Tensor (S, 3)
+        - Tensor (B, S, 3)
+        - list of integers (n values) from triplets_to_n_tensor
+        """
+        if not triplets:
+            return "<NO OUTPUT>"
+        # Handle if input is already n-values (list of ints)
+        if isinstance(triplets, list) and len(triplets) > 0:
+            if isinstance(triplets[0], int):
+                # Already n-values
+                n_values = triplets
+                words = []
+                for n in n_values:
+                    if n in self._n_to_word_cache:
+                        words.append(self._n_to_word_cache[n])
+                    elif n == 0:
+                        words.append("<UNK>")  # Unknown/padding
+                    else:
+                        words.append(f"<N:{n}>")  # Show the n value
+                return " ".join(words)
+        
+        # Convert triplets to tensor if needed
+        if isinstance(triplets, list):
+            triplets_tensor = tensor(triplets, dtype=long)
+        else:
+            triplets_tensor = triplets
+
+        # Normalize shape to (B, S, 3)
+        if triplets_tensor.dim() == 2:
+            triplets_tensor = triplets_tensor.unsqueeze(0)
+
+        triplets_tensor = triplets_tensor.to(self.get_device())
+
+        # Convert triplets → n values
+        n_tensor = self.triplets_to_n_tensor(triplets_tensor)
+
+        # Normalize n_tensor shape
+        if n_tensor.dim() == 0:
+            n_tensor = n_tensor.unsqueeze(0).unsqueeze(0)
+        elif n_tensor.dim() == 1:
+            n_tensor = n_tensor.unsqueeze(0)
+
+        # Decode first sequence (batch size 1)
+        n_values = n_tensor[0].tolist()
+        
+        # Map n → word using reverse cache
+        words = []
+        for n in n_values:
+            if n in self._n_to_word_cache:
+                words.append(self._n_to_word_cache[n])
+            elif n == 0:
+                words.append("<UNK>")
+            else:
+                # Unknown n - show it for debugging
+                words.append(f"<N:{n}>")
+        
+        return " ".join(words)
+
+
+    
+    def _triplet_to_n(self, x, y, z):
+        """
+        Reverse Erdős-Straus with safety.
+        Given (x, y, z), find n such that 4/n ≈ 1/x + 1/y + 1/z
+        Always returns a valid n in [2, vocab_size+1].
+        """
+        numerator = 4 * x * y * z
+        denominator = y*z + x*z + x*y
+
+        if denominator == 0:
+            # Prevent division by zero
+            n = 2
+        else:
+            # Use integer division if exact, else approximate
+            n = numerator // denominator if numerator % denominator == 0 else round(numerator / denominator)
+
+        # Clamp to vocab range
+        n = max(2, min(n, self.vocab_size + 1))
+
+        return n
+    # def _triplet_to_n(self, x, y, z):
+    #     """
+    #     CRITICAL: Reverse Erdős-Straus
+        
+    #     Given (x, y, z), find n such that 4/n = 1/x + 1/y + 1/z
+        
+    #     Solve: 4/n = 1/x + 1/y + 1/z
+    #     →
+    #     n = 4 / (1/x + 1/y + 1/z)
+    #     →
+    #     n = 4xyz / (yz + xz + xy)
+    #     """
+    #     numerator = 4 * x * y * z
+    #     denominator = y*z + x*z + x*y
+        
+    #     if numerator % denominator == 0:
+    #         n = numerator // denominator
+    #         return n
+    #     else:
+    #         # Shouldn't happen if (x,y,z) came from erdos_straus_zera
+    #         raise ValueError(f"Invalid triplet: ({x},{y},{z})")
+
+    def triplets_to_n_tensor(self, triplets_tensor):
+        """
+        Always returns a VALID n ∈ [2, vocab_size+1]
+        No zeros. No UNK. Ever.
+        """
+        x = triplets_tensor[..., 0].clamp(min=1)
+        y = triplets_tensor[..., 1].clamp(min=1)
+        z = triplets_tensor[..., 2].clamp(min=1)
+
+        numerator = 4 * x * y * z
+        denominator = x*y + x*z + y*z
+
+        # Prevent division by zero
+        denominator = where(denominator == 0, full_like(denominator, 1), denominator)
+
+        # Approximate inverse (NEVER zero)
+        n = numerator.float() / denominator.float()
+        n = n.round().long()
+
+        # HARD CLAMP INTO VOCAB
+        n = clamp(n, min=2, max=self.vocab_size + 1)
+
+        return n
+
+
+# def triplets_to_n_tensor(self, triplets_tensor):
+#     """
+#     Always returns a VALID n ∈ [2, vocab_size+1]
+#     No zeros. No UNK. Ever.
+#     """
+#     x = triplets_tensor[..., 0].clamp(min=1)
+#     y = triplets_tensor[..., 1].clamp(min=1)
+#     z = triplets_tensor[..., 2].clamp(min=1)
+
+#     numerator = 4 * x * y * z
+#     denominator = x*y + x*z + y*z
+
+#     # Prevent division by zero
+#     denominator = where(denominator == 0, full_like(denominator, 1), denominator)
+
+#     # Approximate inverse (NEVER zero)
+#     n = numerator.float() / denominator.float()
+#     n = n.round().long()
+
+#     # HARD CLAMP INTO VOCAB
+#     n = clamp(n, min=2, max=self.vocab_size + 1)
+
+#     return n
+
+    # def triplets_to_n_tensor(self, triplets_tensor):
+    #     """
+    #     Safe, vectorized inverse Erdős–Straus:
+    #     (x,y,z) -> n
+    #     triplets_tensor: (B, S, 3), integer, >= 0
+    #     """
+    #     x = triplets_tensor[..., 0]
+    #     y = triplets_tensor[..., 1]
+    #     z = triplets_tensor[..., 2]
+
+    #     numerator = 4 * x * y * z
+    #     denominator = x*y + x*z + y*z
+
+    #     # --- SAFETY MASKS ---
+    #     valid = (denominator != 0) & (numerator != 0) & (numerator % denominator == 0)
+
+    #     n = zeros_like(x, dtype=long)
+    #     n[valid] = numerator[valid] // denominator[valid]
+
+    #     return n
+
+class TripletEncoder(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        assert d_model % 3 == 0, "d_model must be divisible by 3"
+        d = d_model // 3
+
+        self.x_proj = nn.Linear(1, d)
+        self.y_proj = nn.Linear(1, d)
+        self.z_proj = nn.Linear(1, d)
+        self.combine = nn.Linear(d_model, d_model)
+
+    def forward(self, triplets):
+        """
+        triplets: (B, S, 3) log-space
+        """
+        x = triplets[..., 0:1]
+        y = triplets[..., 1:2]
+        z = triplets[..., 2:3]
+
+        x_emb = self.x_proj(x)
+        y_emb = self.y_proj(y)
+        z_emb = self.z_proj(z)
+
+        return self.combine(cat([x_emb, y_emb, z_emb], dim=-1))
+
+class TripletDecoder(nn.Module):
+    def __init__(self, d_model):
+        super().__init__()
+        self.to_x = nn.Linear(d_model, 1)
+        self.to_y = nn.Linear(d_model, 1)
+        self.to_z = nn.Linear(d_model, 1)
+
+    def forward(self, h):
+        """
+        h: (B, S, d_model)
+        returns log-triplets: (B, S, 3)
+        """
+        return cat([
+            self.to_x(h),
+            self.to_y(h),
+            self.to_z(h)
+        ], dim=-1)
+    
+if __name__ == "__main__":
+    import os
+    import sys
+    
+    print("="*60)
+    print("ERDŐS-STRAUS LANGUAGE MODEL")
+    print("Hyena Hierarchy + Triplet Encoding")
+    print("="*60)
+    print()
+    
+    # Default settings
+    config = {
+        'd_model': 256,
+        'n_layers': 6,
+        'n_heads': 1,
+        'learning_rate': 0.001,
+        'batch_size': 16,
+        'epochs': 100,
+        'seq_len': 512,
+        'training_file': r"F:\\agi\\Hyena-Hierarchy\\chatlogs\\aura.txt", # Escape backslashes
+        'checkpoint_dir': r"checkpoints",
+        'save_every': 10,
+        'ewc_lambda': 0.4,
+        'device': 'cuda' if cuda.is_available() else 'cpu'
+    }
+
+    import json
+    config_file = "settings.txt"
+    if not os.path.exists(config_file):
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=4)
+    else:
+        with open(config_file, 'r') as f:
+            loaded_config = json.load(f)
+            config.update(loaded_config)
+    while True:
+        def show_menu():
+            print("\n" + "="*60)
+            print("MAIN MENU")
+            print("="*60)
+            print("1. Train new model")
+            print("2. Continue training (load checkpoint)")
+            print("3. Generate text")
+            print("4. Settings")
+            print("5. Test Erdős-Straus encoding")
+            print("6. Exit")
+            print("="*60)
+            choice = input("Select option: ").strip()
+            return choice
+        
+        def show_settings():
+            print("\n" + "="*60)
+            print("CURRENT SETTINGS")
+            print("="*60)
+            for key, value in config.items():
+                print(f"{key:20s}: {value}")
+            print("="*60)
+            
+            print("\nModify settings? (y/n): ", end="")
+            if input().strip().lower() == 'y':
+                print("\nEnter new values (press Enter to keep current):")
+                
+                for key in ['d_model', 'n_layers', 'n_heads', 'batch_size', 'epochs', 'seq_len', 'save_every']:
+                    current = config[key]
+                    new_val = input(f"{key} [{current}]: ").strip()
+                    if new_val:
+                        config[key] = int(new_val)
+                
+                for key in ['learning_rate', 'ewc_lambda']:
+                    current = config[key]
+                    new_val = input(f"{key} [{current}]: ").strip()
+                    if new_val:
+                        config[key] = float(new_val)
+                
+                for key in ['training_file', 'checkpoint_dir']:
+                    current = config[key]
+                    new_val = input(f"{key} [{current}]: ").strip()
+                    if new_val:
+                        config[key] = new_val
+                
+                print("\n✓ Settings updated!")
+
+        def train_new_model():
+            print("\n" + "="*60)
+            print("TRAINING NEW MODEL")
+            print("="*60)
+            
+            # Check if training file exists
+            if not os.path.exists(config['training_file']):
+                print(f"❌ Error: Training file '{config['training_file']}' not found!")
+                print("Please create aura.txt or update settings.")
+                return
+            
+            # Create checkpoint directory
+            os.makedirs(config['checkpoint_dir'], exist_ok=True)
+            
+            # Initialize model
+            print(f"\nInitializing model...")
+            print(f"  d_model: {config['d_model']}")
+            print(f"  n_layers: {config['n_layers']}")
+            print(f"  n_heads: {config['n_heads']}")
+            print(f"  device: {config['device']}")
+            
+            model = ErdosStrausLanguageModel(
+                d_model=config['d_model'],
+                n_layers=config['n_layers'],
+                # n_heads=config['n_heads'] # TODO: add attention heads support
+            ).to(config['device'])
+            
+            # Load training data
+            print(f"\nLoading training data from {config['training_file']}...")
+            with open(config['training_file'], 'r', encoding='utf-8') as f:
+                text = f.read()
+            
+            print(f"  Text length: {len(text)} characters")
+            
+            # Encode to triplets
+            print("\nEncoding text to Erdős-Straus triplets...")
+            triplets = model.encode_text_to_triplets(text)
+            print(f"  Generated {len(triplets)} triplets")
+            # print device
+            # print(config['device'])
+            log_triplets = model.triplets_to_log_tensor(triplets, device_name=config['device'])
+            
+            # if len(triplets) > 0:
+            #     print(f"  Sample triplet: {triplets[0]}")
+            
+            # Setup optimizer
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=config['learning_rate']
+            )
+            
+            # Training loop
+            print(f"\nStarting training for {config['epochs']} epochs...")
+            print(f"  Batch size: {config['batch_size']}")
+            print(f"  Sequence length: {config['seq_len']}")
+            print(f"  Saving checkpoints every {config['save_every']} epochs")
+            print()
+            
+            
+            for epoch in range(config['epochs']):
+                model.train()
+                total_loss = 0.0
+                num_batches = 0
+                for i in range(0, log_triplets.size(1) - config['seq_len'] - 1,
+                config['batch_size']):
+                    if num_batches >= 2000:
+                        break
+                    # slice tensor, not list
+                    input_seq = log_triplets[:, i:i+config['seq_len']]
+                    target_seq = log_triplets[:, i+1:i+config['seq_len']+1]
+
+                    optimizer.zero_grad()
+
+                    pred = model.forward(input_seq)              # (1, S, 3)
+                    loss = F.mse_loss(pred, target_seq)  # log-space regression
+
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    num_batches += 1
+                    tqdm.tqdm.write(f"  Epoch {epoch+1}, Batch {num_batches}, Loss: {loss.item():.6f}")      
+          
+                avg_loss = total_loss / max (num_batches, 1)
+                
+                # Print progress
+                print(f"Epoch {epoch+1}/{config['epochs']} | Loss: {avg_loss:.6f}")
+                # Save checkpoint
+                if (epoch + 1) % config['save_every'] == 0:
+                    checkpoint_path = os.path.join(
+                        config['checkpoint_dir'],
+                        f"model_epoch_{epoch+1}.pt"
+                    )
+                    save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': model.hyena_core.state_dict(),
+                        # 'optimizer_state_dict': optimizer.state_dict(),
+                        'encoder': model.triplet_encoder.state_dict(),
+                        'decoder': model.triplet_decoder.state_dict(),
+                        'loss': avg_loss,
+                        'config': config
+                    }, checkpoint_path) 
+                    print(f"  💾 Checkpoint saved: {checkpoint_path}")
+            
+            print("\n✓ Training complete!")
+            
+            # Final save
+            final_path = os.path.join(config['checkpoint_dir'], "model_final.pt")
+            save({
+                'model_state_dict': model.hyena_core.state_dict(),
+                'encoder': model.triplet_encoder.state_dict(),
+                'decoder': model.triplet_decoder.state_dict(),
+                'loss': avg_loss,
+                'config': config
+            }, final_path)
+            print(f"✓ Final model saved: {final_path}")
+        
+        def continue_training():
+            print("\n" + "="*60)
+            print("CONTINUE TRAINING")
+            print("="*60)
+
+            # Checkpoint directory
+            if not os.path.exists(config['checkpoint_dir']):
+                print("❌ No checkpoints found!")
+                return
+
+            checkpoints = sorted(
+                [f for f in os.listdir(config['checkpoint_dir']) if f.endswith('.pt')]
+            )
+
+            if not checkpoints:
+                print("❌ No checkpoint files found!")
+                return
+
+            print("\nAvailable checkpoints:")
+            for i, ckpt in enumerate(checkpoints):
+                print(f"  {i+1}. {ckpt}")
+
+            choice = input("\nSelect checkpoint (number): ").strip()
+            try:
+                idx = int(choice) - 1
+                checkpoint_path = os.path.join(config['checkpoint_dir'], checkpoints[idx])
+            except Exception:
+                print("❌ Invalid selection!")
+                return
+
+            print(f"\nLoading checkpoint: {checkpoint_path}")
+            checkpoint = load(checkpoint_path, map_location=config['device'])
+
+            # Restore config (but keep runtime device)
+            saved_config = checkpoint.get('config', {})
+            saved_device = config['device']
+            config.update(saved_config)
+            config['device'] = saved_device
+
+            # Initialize model
+            model = ErdosStrausLanguageModel(
+                d_model=config['d_model'],
+                n_layers=config['n_layers'],
+            ).to(config['device'])
+
+            # Load all weights
+            model.hyena_core.load_state_dict(checkpoint['model_state_dict'])
+            model.triplet_encoder.load_state_dict(checkpoint['encoder'])
+            model.triplet_decoder.load_state_dict(checkpoint['decoder'])
+
+            start_epoch = checkpoint.get('epoch', 0)
+            print(f"✓ Model restored from epoch {start_epoch}")
+            print(f"  Previous loss: {checkpoint.get('loss', 'unknown')}")
+
+            # Load training data
+            if not os.path.exists(config['training_file']):
+                print(f"❌ Training file '{config['training_file']}' not found!")
+                return
+
+            print("\nReloading training data...")
+            with open(config['training_file'], 'r', encoding='utf-8') as f:
+                text = f.read()
+
+            # Rebuild vocabulary deterministically
+            print("Rebuilding vocabulary...")
+            triplets = model.encode_text_to_triplets(text)
+            log_triplets = model.triplets_to_log_tensor(triplets, config['device'])
+
+            print(f"  Vocabulary size: {len(model._word_to_n_cache)} words")
+            print(f"  Total triplets: {len(triplets)}")
+
+            # Optimizer (fresh optimizer is correct here)
+            optimizer = optim.AdamW(
+                model.parameters(),
+                lr=config['learning_rate']
+            )
+
+            print("\nResuming training...")
+            print(f"  From epoch: {start_epoch + 1}")
+            print(f"  To epoch:   {config['epochs']}")
+            print()
+
+            for epoch in range(start_epoch, config['epochs']):
+                model.train()
+                total_loss = 0.0
+                num_batches = 0
+
+                for i in range(
+                    0,
+                    log_triplets.size(1) - config['seq_len'] - 1,
+                    config['batch_size']
+                ):
+                    if num_batches >= 2000:
+                        break
+
+                    input_seq = log_triplets[:, i:i + config['seq_len']]
+                    target_seq = log_triplets[:, i + 1:i + config['seq_len'] + 1]
+
+                    # Skip too-short sequences safely
+                    if input_seq.size(1) < model.hyena_core.kernel_size:
+                        continue
+
+                    optimizer.zero_grad()
+
+                    pred = model.forward(input_seq)
+                    loss = F.mse_loss(pred, target_seq)
+
+                    loss.backward()
+                    optimizer.step()
+
+                    total_loss += loss.item()
+                    num_batches += 1
+
+                avg_loss = total_loss / max(num_batches, 1)
+                print(f"Epoch {epoch + 1}/{config['epochs']} | Loss: {avg_loss:.6f}")
+
+                # Save checkpoint
+                if (epoch + 1) % config['save_every'] == 0:
+                    checkpoint_path = os.path.join(
+                        config['checkpoint_dir'],
+                        f"model_epoch_{epoch + 1}.pt"
+                    )
+                    save({
+                        'epoch': epoch + 1,
+                        'model_state_dict': model.hyena_core.state_dict(),
+                        'encoder': model.triplet_encoder.state_dict(),
+                        'decoder': model.triplet_decoder.state_dict(),
+                        'loss': avg_loss,
+                        'config': config
+                    }, checkpoint_path)
+                    print(f"  💾 Checkpoint saved: {checkpoint_path}")
+
+            print("\n✓ Continued training complete!")
+
+            # Final save
+            final_path = os.path.join(config['checkpoint_dir'], "model_final.pt")
+            save({
+                'epoch': config['epochs'],
+                'model_state_dict': model.hyena_core.state_dict(),
+                'encoder': model.triplet_encoder.state_dict(),
+                'decoder': model.triplet_decoder.state_dict(),
+                'loss': avg_loss,
+                'config': config
+            }, final_path)
+
+            print(f"✓ Final model saved: {final_path}") 
+
+        def generate_text():
+            print("\n" + "="*60)
+            print("GENERATE TEXT")
+            print("="*60)
+            
+            # Load model
+            model_path = os.path.join(config['checkpoint_dir'], "model_final.pt")
+            
+            if not os.path.exists(model_path):
+                print("❌ No trained model found!")
+                print("   Train a model first (option 1)")
+                return
+            
+            print(f"Loading model from {model_path}...")
+            checkpoint = load(model_path)
+            
+            model = ErdosStrausLanguageModel(
+                d_model=config['d_model'],
+                n_layers=config['n_layers'],
+            ).to(config['device'])
+            
+            # Load weights
+            model.hyena_core.load_state_dict(checkpoint['model_state_dict'])
+            model.triplet_encoder.load_state_dict(checkpoint['encoder'])
+            model.triplet_decoder.load_state_dict(checkpoint['decoder'])
+            
+            model.eval()
+            
+            print("✓ Model loaded!")
+            
+            # IMPORTANT: Rebuild vocabulary from training file
+            print("Rebuilding vocabulary...")
+            with open(config['training_file'], 'r', encoding='utf-8') as f:
+                training_text = f.read()
+            
+            # This populates the word ↔ n mappings
+            _ = model.encode_text_to_triplets(training_text)
+            print(f"  Vocabulary size: {len(model._word_to_n_cache)} words")
+            
+            # Get prompt
+            print("\nEnter prompt (or press Enter for default):")
+            prompt = input("> ").strip()
+            
+            if not prompt:
+                prompt = "Aura:"
+            
+            # Generate
+            print("\nGenerating...")
+            max_length = input("Max tokens to generate [50]: ").strip()
+            max_length = int(max_length) if max_length else 50
+            
+            try:
+                # Encode prompt
+                start_triplets = model.encode_text_to_triplets(prompt)
+                print(f"Prompt encoded to {len(start_triplets)} triplets")
+                
+                # Generate
+                generated_text = model.generate(start_triplets, temperature=config['temperature'] or 0.7,steps=max_length)
+                
+                print("\n" + "="*60)
+                print("GENERATED TEXT")
+                print("="*60)
+                print(generated_text)
+                print("="*60)
+                
+            except Exception as e:
+                import traceback
+                print(f"❌ Error during generation: {e}")
+                traceback.print_exc()
+
+        def test_erdos_straus():
+            print("\n" + "="*60)
+            print("TEST ERDŐS-STRAUS ENCODING")
+            print("="*60)
+            
+            test_words = ["hello", "world", "test", "erdos", "straus"]
+            
+            model = ErdosStrausLanguageModel()
+            
+            for word in test_words:
+                n = model._word_to_n(word)
+                x, y, z = ErdosStrausLanguageModel.erdos_straus_zera(n)
+                n_reconstructed = model._triplet_to_n(x, y, z)
+                valid = (n == n_reconstructed)
+                
+                print(f"Word: '{word}' | n: {n} | Triplet: ({x}, {y}, {z}) | Reconstructed n: {n_reconstructed} | Valid: {valid}")
+        while True:
+            choice = show_menu()
+            
+            if choice == '1':
+                train_new_model()
+            elif choice == '2':
+                continue_training()
+            elif choice == '3':
+                generate_text()
+            elif choice == '4':
+                show_settings()
+            elif choice == '5':
+                test_erdos_straus()
+            elif choice == '6':
+                print("\nExiting. Goodbye!")
+                break
+            else:
+                print("❌ Invalid option. Please try again.")
